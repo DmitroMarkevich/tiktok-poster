@@ -1,0 +1,39 @@
+# ── Secrets / credentials ─────────────────────────────────────────────
+.env
+*.env
+!.env.example
+
+# Account sessions & cookies (NEVER commit — contains live TikTok logins)
+*.db
+*.sqlite
+*.sqlite3
+browsers/
+
+# ── Local debug scripts (contain hardcoded proxy credentials) ─────────
+test_*.py
+debug_hashtag.py
+verify_comment.py
+
+# ── Runtime / generated ───────────────────────────────────────────────
+bot.log
+*.log
+videos/
+sample-*.mp4
+
+# ── Python ────────────────────────────────────────────────────────────
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+
+# ── IDE / OS ──────────────────────────────────────────────────────────
+.idea/
+.vscode/
+.DS_Store
+
+# ── Claude Code local config ──────────────────────────────────────────
+.claude/
