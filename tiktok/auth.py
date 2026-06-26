@@ -166,3 +166,22 @@ async def verify_logged_in(context: BrowserContext) -> bool:
     await asyncio.sleep(3)
     login_btn = await page.locator("[data-e2e='top-login-button']").count()
     return login_btn == 0
+
+
+async def verify_logged_in_robust(context: BrowserContext, attempts: int = 3,
+                                  delay: float = 2.5) -> bool:
+    """verify_logged_in with retries — only False if EVERY attempt fails.
+
+    A single check flakes constantly (slow load, transient redirect, a captcha on the check
+    page); a false negative makes the user re-import perfectly good cookies. One success at
+    any attempt means the session is fine. Shared by the health loop AND the manual
+    «Перевірити сесії» path so neither can declare a live account dead on one flaky read."""
+    for attempt in range(attempts):
+        try:
+            if await verify_logged_in(context):
+                return True
+        except Exception:
+            pass
+        if attempt < attempts - 1:
+            await asyncio.sleep(delay)
+    return False

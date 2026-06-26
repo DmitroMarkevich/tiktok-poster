@@ -6,12 +6,24 @@ from typing import Optional, Tuple
 import aiohttp
 from playwright.async_api import BrowserContext, Page
 from .browser import get_page
+from . import dedup
 from utils.captcha import solve_captcha_if_present
 from utils.ai import generate_comment_variants
+from utils.humanize import human_click, human_scroll, human_type
 import config
 
 
-_BLOCKED_RESOURCE_TYPES = ("image", "media", "font")
+# Always block images (thumbnails — the byte bulk, and not a viewing signal). VIDEO ("media")
+# is blocked ONLY when config.BLOCK_VIDEO_MEDIA is set: an account that dwells on a video and
+# likes it but streams 0 CDN segments is a server-side "not a real viewer" tell that feeds the
+# shadow-filter, so the realistic default lets video through. Fonts are never blocked (small,
+# and a page with every webfont failing is itself an abnormal, detectable pattern).
+_BLOCKED_RESOURCE_TYPES = ("image", "media") if config.BLOCK_VIDEO_MEDIA else ("image",)
+
+# How many of a run's comments to guest-verify for shadowban. Shadowban is an
+# account-level state, so a small random sample estimates trust just as well as
+# checking every comment, while keeping verification time roughly constant.
+_SHADOWBAN_SAMPLE = 4
 
 _SPINTAX_RE = re.compile(r"\{([^{}]*)\}")
 
@@ -83,27 +95,51 @@ async def _goto_retry(page: Page, url: str, retries: int = 3, **kwargs):
     raise last_err
 
 
-async def _get_videos_tikwm(keyword: str, count: int) -> list:
-    """Fallback: get video URLs from tikwm.com (no browser needed)."""
+async def get_videos_tikwm(keyword: str, want: int = 15) -> list:
+    """Get up to ~`want` video URLs from tikwm.com keyword search (no browser needed).
+
+    This is scrape_hashtag_videos' PRIMARY source, and it's a plain HTTP call — no
+    browser, proxy or CAPTCHA. Exposed (not `_`-private) so the bulk handler can try it
+    BEFORE launching a scout browser, and only pay for Chrome when it comes up short.
+
+    `want` is the desired pool size, NOT the number of comments to post. A single tikwm
+    page returns at most ~29 results, so we PAGINATE via the cursor to reach `want`:
+      • even a comment-on-1 run needs a buffer — videos get skipped (already commented,
+        claimed by another account) or fail (no comment box, CAPTCHA, timeout), so a pool
+        of 5 often can't yield even 1 success;
+      • a bulk run needs one DISTINCT video per account (the global claim stops two
+        accounts piling onto the same video → shadow-filter), so the pool must scale past
+        a single page.
+    Returns whatever was collected (possibly partial) — never raises."""
+    urls: list = []
+    seen: set = set()
+    cursor = 0
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.get(
-                "https://www.tikwm.com/api/feed/search",
-                params={"keywords": keyword, "count": min(count * 5, 50), "cursor": 0, "web": 1},
-                headers={"User-Agent": "Mozilla/5.0"},
-                timeout=aiohttp.ClientTimeout(total=15),
-            ) as r:
-                data = await r.json(content_type=None)
-        videos = data.get("data", {}).get("videos", [])
-        urls = []
-        for v in videos:
-            vid_id = v.get("video_id") or v.get("id")
-            author = (v.get("author") or {}).get("unique_id", "")
-            if vid_id and author:
-                urls.append(f"https://www.tiktok.com/@{author}/video/{vid_id}")
-        return urls
+            for _ in range(6):  # ~29/page → up to ~170; capped so a sparse keyword can't loop forever
+                async with session.get(
+                    "https://www.tikwm.com/api/feed/search",
+                    params={"keywords": keyword, "count": 30, "cursor": cursor, "web": 1},
+                    headers={"User-Agent": "Mozilla/5.0"},
+                    timeout=aiohttp.ClientTimeout(total=15),
+                ) as r:
+                    data = await r.json(content_type=None)
+                d = data.get("data", {}) or {}
+                videos = d.get("videos", []) or []
+                for v in videos:
+                    vid_id = v.get("video_id") or v.get("id")
+                    author = (v.get("author") or {}).get("unique_id", "")
+                    if vid_id and author:
+                        u = f"https://www.tiktok.com/@{author}/video/{vid_id}"
+                        if u not in seen:
+                            seen.add(u)
+                            urls.append(u)
+                if len(urls) >= want or not videos or not d.get("hasMore"):
+                    break
+                cursor = d.get("cursor") or (cursor + len(videos))
     except Exception:
-        return []
+        pass
+    return urls
 
 
 async def _collect_dom_videos(page: Page, max_scroll: int = 20, target: int = None) -> list:
@@ -147,8 +183,9 @@ async def scrape_hashtag_videos(context: BrowserContext, hashtag: str, count: in
     tag = hashtag.lstrip("#")
     dbg = []
 
-    # 1. tikwm keyword search — relevance-ranked, no browser/CAPTCHA needed.
-    video_urls = await _get_videos_tikwm(tag, count)
+    # 1. tikwm keyword search — relevance-ranked, no browser/CAPTCHA needed. Pull several
+    # times `count` so there's a buffer for videos that get skipped/fail downstream.
+    video_urls = await get_videos_tikwm(tag, max(count * 5, 15))
     dbg.append(f"tikwm search: {len(video_urls)}")
     if len(video_urls) >= count:
         return video_urls, "\n".join(dbg)
@@ -188,6 +225,13 @@ async def comment_on_hashtag_videos(
     debug=None,
     send_screenshot=None,
     video_urls: Optional[list] = None,
+    account_id: Optional[int] = None,
+    proxy: Optional[str] = None,
+    verify_shadowban: bool = True,
+    username: str = "",
+    engage: bool = True,
+    defer_shadowban: bool = False,
+    posted_out: Optional[list] = None,
 ) -> Tuple[int, str]:
     tag = hashtag.lstrip("#")
     dbg = []
@@ -231,9 +275,27 @@ async def comment_on_hashtag_videos(
     # a manually posted comment also appears only after a while.
     commented = 0
     commented_urls = []
+    posted = []  # (url, vid, text) for each OK — fed to the shadowban check below
+    skipped_dup = 0
     for i, url in enumerate(video_urls):
         if commented >= count:
             break
+
+        # ── Anti-duplication (skip cheap, before opening a page) ──────────────
+        # Two layers ported from multicombine: per-account history (never comment
+        # the same video twice) + global claim (one account per video, so a cluster
+        # of accounts doesn't pile onto identical videos → shadow-filter trigger).
+        vid = dedup.extract_video_id(url)
+        if account_id is not None:
+            if dedup.already_commented(account_id, vid):
+                skipped_dup += 1
+                dbg.append(f"↷ вже коментував {vid}")
+                continue
+            if not dedup.try_claim(vid, account_id, tag):
+                skipped_dup += 1
+                dbg.append(f"↷ зайнято іншим акаунтом {vid}")
+                continue
+
         video_page = await context.new_page()
         try:
             # Fresh, unique-per-video string: walk the shuffled AI pool in order (so
@@ -246,7 +308,9 @@ async def comment_on_hashtag_videos(
             # this video after 150s and move on.
             try:
                 ok, reason = await asyncio.wait_for(
-                    _post_comment_with_captcha(video_page, url, rendered), timeout=150
+                    _post_comment_with_captcha(video_page, url, rendered,
+                                               account_id=account_id, username=username),
+                    timeout=150,
                 )
             except asyncio.TimeoutError:
                 ok, reason = False, "таймаут відео (>150с) — пропускаю"
@@ -254,27 +318,127 @@ async def comment_on_hashtag_videos(
             if ok:
                 commented += 1
                 commented_urls.append(url)
+                posted.append((url, vid, rendered))
                 dbg.append(f"✓ {url}")
+                if account_id is not None:
+                    dedup.record_comment(account_id, vid, comment_text=rendered)
+                    dedup.mark_success(vid)
                 await asyncio.sleep(random.uniform(8, 20))
             else:
                 dbg.append(f"✗ {url} — {reason}")
+                if account_id is not None:
+                    dedup.mark_failed(vid)  # release claim so another account may try
         except Exception as e:
+            # Surface the real error: this branch used to swallow exceptions silently
+            # (only into the Telegram dbg list), so a crash mid-post looked like the
+            # video was just skipped — no [comment] line, no comment posted.
+            import traceback
+            print(f"[comment] ERROR {url} — {type(e).__name__}: {e}", flush=True)
+            traceback.print_exc()
             dbg.append(f"✗ {e}")
+            if account_id is not None:
+                dedup.mark_failed(vid)
         finally:
             try:
                 await video_page.close()
             except Exception:
                 pass
 
+    # ── Shadowban check ────────────────────────────────────────────────────────
+    # "OK" only proves the comment rendered in the author's own session. Re-open each
+    # posted video as a logged-out guest and confirm the comment is visible to others;
+    # an account-shadowbanned comment is present for its author but absent for everyone
+    # else. Verdicts: survived / shadowbanned / inconclusive (don't blame the account).
+    survived = banned = inconclusive = 0
+    deferred = False
+    if posted and defer_shadowban and posted_out is not None:
+        # Hand the posted comments back to the caller, which runs the guest-verify in the
+        # BACKGROUND after releasing the account lock + concurrency slot — so this account's
+        # ~40s of propagation-sleep + verification no longer blocks the next account.
+        posted_out.extend(posted)
+        deferred = True
+    elif verify_shadowban and posted:
+        survived, banned, inconclusive = await verify_posted_shadowban(
+            proxy, account_id, username, posted, dbg=dbg
+        )
+
+    # ── Engagement ─────────────────────────────────────────────────────────────
+    # After posting, an account that also replies to comments on its OWN latest video
+    # looks like a real creator (extra organic signal), not a one-way comment bot.
+    # Best-effort — never let it fail the run.
+    replied = 0
+    if engage and commented > 0:
+        if account_id is not None:
+            from tiktok import live_state
+            live_state.update(account_id, username=username, phase="engagement (відповіді)")
+        try:
+            from tiktok.engagement import reply_to_latest_video_comments
+            replied = await reply_to_latest_video_comments(context)
+        except Exception as e:
+            dbg.append(f"engagement error: {e}")
+
     debug_lines = [
         f"Хештег: #{tag}",
         f"Знайдено відео: {len(video_urls)}",
+        f"Пропущено (дублі/зайнято): {skipped_dup}",
         f"Прокоментовано: {commented}",
-        "Відео:",
-    ] + [f"  {u}" for u in commented_urls] + [
-        f"Log: {dbg}",
     ]
+    if engage and commented > 0:
+        debug_lines.append(f"Відповідей під своїм відео: {replied}")
+    if deferred:
+        debug_lines.append(f"Перевірка шедоубану: у фоні ({len(posted)} коментар(ів))")
+    elif verify_shadowban and posted:
+        debug_lines.append(
+            f"Перевірка (вибірка {survived + banned + inconclusive}/{len(posted)}): "
+            f"Вижило {survived} · Шедоубан {banned} · Невизначено {inconclusive}"
+        )
+        if account_id is not None:
+            s, b, checked, pct = dedup.account_trust(account_id)
+            if checked:
+                debug_lines.append(f"Trust акаунта: {pct:.0f}% ({s}/{checked} видимих)")
+    debug_lines += ["Відео:"] + [f"  {u}" for u in commented_urls] + [f"Log: {dbg}"]
+    if account_id is not None:
+        from tiktok import live_state
+        live_state.finish(account_id, phase=f"завершено · {commented} коментарів")
     return commented, "\n".join(debug_lines)
+
+
+async def verify_posted_shadowban(proxy, account_id, username, posted, dbg=None):
+    """Guest-verify a SAMPLE of posted comments for shadowban and write the verdicts to
+    dedup. Returns (survived, banned, inconclusive). Sampling keeps verification time
+    roughly constant (shadowban is an account-level state, so a handful estimates trust
+    as well as checking all). Used both inline and as the deferred background pass."""
+    from tiktok.shadowban import verify_comments_visible
+    survived = banned = inconclusive = 0
+    if not posted:
+        return 0, 0, 0
+    if account_id is not None:
+        from tiktok import live_state
+        live_state.update(account_id, username=username, phase="перевірка шедоубану")
+    sample = posted if len(posted) <= _SHADOWBAN_SAMPLE else random.sample(posted, _SHADOWBAN_SAMPLE)
+    await asyncio.sleep(20)  # let the freshest comment propagate server-side
+    try:
+        verdicts = await verify_comments_visible(proxy, [(u, t) for (u, _v, t) in sample])
+    except Exception as e:
+        verdicts = {}
+        if dbg is not None:
+            dbg.append(f"shadowban check error: {e}")
+    for url, vid, _text in sample:
+        verdict = verdicts.get(url)
+        if account_id is not None:
+            dedup.set_visibility(account_id, vid, verdict)
+        if verdict is True:
+            survived += 1
+        elif verdict is False:
+            banned += 1
+            if dbg is not None:
+                dbg.append(f"👻 shadowban: {url}")
+        else:
+            inconclusive += 1
+    if account_id is not None:
+        from tiktok import live_state
+        live_state.finish(account_id, phase="перевірка завершена")
+    return survived, banned, inconclusive
 
 
 async def _human_delay(a: float, b: float):
@@ -292,7 +456,7 @@ async def _watch_video(page: Page):
     try:
         await _human_delay(1.2, 2.5)
         for _ in range(random.randint(1, 2)):
-            await page.mouse.wheel(0, random.randint(120, 320))
+            await human_scroll(page, random.uniform(120, 320))
             await _human_delay(0.5, 1.0)
         await _human_delay(2.0, 5.0)  # actual "watching"
     except Exception:
@@ -310,51 +474,117 @@ async def _maybe_like(page: Page, prob: float = 0.5):
             el = page.locator(sel).first
             if await el.is_visible(timeout=1500):
                 await _human_delay(0.4, 1.2)
-                await el.click()
+                # Curved cursor move + click (human_click caps its own waits, so the
+                # like — which is optional — can't hang 30s on a blocked icon).
+                await human_click(page, el, timeout=4000)
                 return
         except Exception:
             pass
 
 
 async def _read_comments(page: Page):
-    """Scroll the comment list a little, as if reading the room, before posting."""
-    try:
-        lst = page.locator("[data-e2e='comment-list']").first
-        for _ in range(random.randint(1, 2)):
-            try:
-                await lst.evaluate("el => el.scrollBy(0, 250)")
-            except Exception:
-                await page.mouse.wheel(0, 250)
-            await _human_delay(0.5, 1.0)
-    except Exception:
-        pass
+    """Scroll the comment list a little, as if reading the room, before posting.
+
+    Uses page.evaluate with a null-safe querySelector, NOT locator.evaluate: a locator
+    auto-waits 30s for the element to attach, and the comment LIST often renders a beat
+    after the input box — profiling caught this as a 31s 'read+like' phase. Null-safe
+    JS just no-ops when the list isn't there yet, so reading stays cosmetic and cheap."""
+    for _ in range(random.randint(1, 2)):
+        try:
+            scrolled = await page.evaluate(
+                "() => { const el = document.querySelector(\"[data-e2e='comment-list']\");"
+                " if (el) { el.scrollBy(0, 250); return true; } return false; }"
+            )
+            if not scrolled:
+                await human_scroll(page, 250)
+        except Exception:
+            pass
+        await _human_delay(0.5, 1.0)
 
 
 async def _human_type(page: Page, text: str):
-    """Type with a variable per-keystroke delay and occasional 'thinking' pauses,
-    instead of a robotic fixed cadence."""
-    for ch in text:
-        await page.keyboard.type(ch, delay=random.uniform(45, 160))
-        if random.random() < 0.06:
-            await asyncio.sleep(random.uniform(0.3, 1.1))
+    """Type with variable cadence, thinking pauses, and rare typo+backspace corrections.
+    Thin wrapper over utils.humanize.human_type (shared with the uploader/engagement)."""
+    await human_type(page, text)
 
 
-async def _post_comment_with_captcha(page: Page, video_url: str, text: str) -> Tuple[bool, str]:
+class _Timer:
+    """Lightweight per-phase profiler. mark() prints the time since the previous mark,
+    so a run's log shows exactly where the seconds go (goto / watch / captcha / type…).
+    Temporary instrumentation — strip once the bottleneck is found."""
+    def __init__(self, label: str):
+        import time
+        self._time = time.monotonic
+        self.label = label
+        self.t = self._time()
+    def mark(self, phase: str):
+        now = self._time()
+        print(f"[timing] {self.label} {phase}: {now - self.t:.1f}s", flush=True)
+        self.t = now
+
+
+class _Progress:
+    """Per-video timing + live status + screenshot, so the Telegram '📊 Статус' view can
+    show where each account's bot is. On every phase mark it prints the timing, writes a
+    fresh page screenshot to disk, and pushes the phase into live_state. account_id=None
+    (no live tracking wanted) makes it behave like a plain timer."""
+    def __init__(self, page, video_url, account_id=None, username=""):
+        self.page = page
+        self.account_id = account_id
+        self.username = username
+        self.video_url = video_url
+        self.tm = _Timer(video_url.rsplit("/", 1)[-1])
+
+    async def mark(self, phase: str):
+        self.tm.mark(phase)
+        if self.account_id is None:
+            return
+        try:
+            import os
+            from tiktok import live_state
+            os.makedirs(live_state.SCREENSHOT_DIR, exist_ok=True)
+            shot = f"{live_state.SCREENSHOT_DIR}/{self.account_id}.png"
+            try:
+                await self.page.screenshot(path=shot, timeout=3000)
+            except Exception:
+                pass  # keep the previous screenshot file if this capture fails
+            live_state.update(self.account_id, username=self.username, phase=phase,
+                              video_url=self.video_url, screenshot=shot)
+        except Exception:
+            pass
+
+
+async def _post_comment_with_captcha(page: Page, video_url: str, text: str,
+                                     account_id=None, username="") -> Tuple[bool, str]:
     """Navigate to video URL, solve CAPTCHA if needed, post comment.
     Returns (success, reason) — reason explains exactly where it stopped, so
     debug reports can pinpoint the failing step instead of a generic "no comment box"."""
     if not video_url.startswith("http"):
         video_url = "https://www.tiktok.com" + video_url
 
+    prog = _Progress(page, video_url, account_id=account_id, username=username)
     await _goto_retry(page, video_url, wait_until="domcontentloaded")
     await asyncio.sleep(2)
+    await prog.mark("goto+settle")
+
+    # Cheap relevance/skip guards BEFORE spending time on captcha/typing:
+    #  • LIVE pages have a different comment UI — commenting there is flaky and pointless;
+    #  • a foreign-language video is an irrelevant target — posting a Ukrainian comment
+    #    there is wasted and a spam signal (shadow-filter). Skip both early.
+    from tiktok.page_guards import is_live_stream, has_cyrillic_description
+    if await is_live_stream(page):
+        return False, "лайв-стрім — пропускаю"
+    if not await has_cyrillic_description(page):
+        return False, "інша мова відео — пропускаю"
 
     # Solve initial CAPTCHA (may appear immediately on video page)
     await _solve_captcha_blocking(page)
     await asyncio.sleep(0.5)
+    await prog.mark("captcha#1")
 
     # Behave like a viewer first: watch a bit before going for the comment box.
     await _watch_video(page)
+    await prog.mark("watch_video")
 
     # Open comment panel — click icon if input isn't visible yet
     comment_box = await _find_comment_input(page)
@@ -363,15 +593,21 @@ async def _post_comment_with_captcha(page: Page, video_url: str, text: str) -> T
             try:
                 btn = page.locator(btn_sel).first
                 if await btn.is_visible(timeout=2000):
-                    await btn.click()
+                    # Explicit timeout: a blocked click otherwise hangs on Playwright's
+                    # 30s default — profiling caught two of these stacking to 60s on a
+                    # video whose comment box wasn't accessible (login-walled / comments
+                    # off). Fail fast and skip instead.
+                    await btn.click(timeout=4000)
                     await asyncio.sleep(1.2)
                     break
             except Exception:
                 pass
 
+    await prog.mark("open_comments")
     # Solve CAPTCHA that may have appeared after clicking icon
     await _solve_captcha_blocking(page)
     await asyncio.sleep(0.5)
+    await prog.mark("captcha#2")
 
     # Re-find comment input after CAPTCHA is gone
     comment_box = await _find_comment_input(page)
@@ -381,6 +617,7 @@ async def _post_comment_with_captcha(page: Page, video_url: str, text: str) -> T
     # Read the room and (sometimes) like — engagement that a commenting human does.
     await _read_comments(page)
     await _maybe_like(page, prob=0.5)
+    await prog.mark("read+like")
 
     # Focus the comment box. The blocker is usually NOT a CAPTCHA (cookie banner,
     # login-guide modal, joyride coach-marks, leftover TUXModal backdrop), so on ANY
@@ -392,9 +629,12 @@ async def _post_comment_with_captcha(page: Page, video_url: str, text: str) -> T
     clicked = False
     for attempt in range(3):
         try:
-            await comment_box.click(timeout=4000)
-            clicked = True
-            break
+            # Curved cursor path → hover → trusted click (not a teleport) on the comment
+            # box: the comment flow is the hottest shadow-ban path, so the focus click must
+            # carry a real mousemove stream. Falls back to a plain click internally.
+            if await human_click(page, comment_box, timeout=4000):
+                clicked = True
+                break
         except Exception:
             await _solve_captcha_blocking(page)
             await _dismiss_overlays(page)
@@ -417,6 +657,7 @@ async def _post_comment_with_captcha(page: Page, video_url: str, text: str) -> T
             pass
     if not clicked:
         return False, "клік по полю заблоковано оверлеєм"
+    await prog.mark("focus_input")
 
     # Type with retry — verify the text actually landed in the contenteditable.
     # A lost click/focus silently leaves the input empty and the Post button stays
@@ -441,6 +682,7 @@ async def _post_comment_with_captcha(page: Page, video_url: str, text: str) -> T
 
     if not typed:
         return False, "текст не потрапив у поле (втрачено фокус)"
+    await prog.mark("type_text")
 
     # Beat before submitting — a person re-reads their comment, doesn't fire instantly.
     await _human_delay(0.4, 1.2)
@@ -466,9 +708,9 @@ async def _post_comment_with_captcha(page: Page, video_url: str, text: str) -> T
             except Exception:
                 disabled = False
             if not disabled:
-                await btn.click()
-                submitted = True
-                break
+                submitted = await human_click(page, btn, timeout=5000)
+                if submitted:
+                    break
             await asyncio.sleep(0.5)
 
     if not submitted:
@@ -476,6 +718,13 @@ async def _post_comment_with_captcha(page: Page, video_url: str, text: str) -> T
 
     # Local check: did the comment register client-side after Post? If it never even
     # appears locally, the submission failed (server rejected it outright).
+    # Match a NORMALISED PREFIX, not the exact full text: TikTok collapses whitespace and
+    # truncates long comments with "… more", so `text in page_text` false-negatives on long
+    # comments — and a false negative is dangerous here: it returns failure, the claim is
+    # released and the comment is NOT recorded, so a re-run lets the SAME account comment the
+    # SAME video twice (a strong shadow-ban trigger). The prefix match mirrors shadowban._signature.
+    _norm = lambda s: re.sub(r"\s+", " ", (s or "").strip())
+    needle = _norm(text)[:40]
     appeared_locally = False
     elapsed = 0.0
     while elapsed < 10.0:
@@ -483,7 +732,7 @@ async def _post_comment_with_captcha(page: Page, video_url: str, text: str) -> T
             page_text = await page.evaluate(
                 "() => (document.querySelector(\"[data-e2e='comment-list']\") || document.body).innerText"
             )
-            if text in page_text:
+            if needle and needle in _norm(page_text):
                 appeared_locally = True
                 break
         except Exception:
@@ -491,6 +740,7 @@ async def _post_comment_with_captcha(page: Page, video_url: str, text: str) -> T
         await asyncio.sleep(0.8)
         elapsed += 0.8
 
+    await prog.mark("submit+verify")
     if not appeared_locally:
         return False, "кнопку Post натиснуто, але коментар не з'явився локально (сервер відхилив?)"
 

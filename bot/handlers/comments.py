@@ -13,12 +13,21 @@ from database import async_session_factory
 from database.repository import AccountRepo, CommentRepo
 from tiktok.browser import create_context, save_session
 from tiktok.commenter import comment_on_hashtag_videos
+from tiktok import dedup
+from utils.policy_filter import risk_warning
 from config import BROWSERS_DIR, SUPERADMIN_ID
 
 router = Router()
 
 _running: set[int] = set()
-_COMMENT_SEMAPHORE = asyncio.Semaphore(3)
+# Detached background shadowban verifications. Kept in a module-level set so the running
+# loop holds a reference (a bare ensure_future could be GC'd mid-flight); auto-discarded
+# when each finishes.
+_BG_VERIFY_TASKS: set = set()
+# Concurrent accounts commenting at once. Their long human-like pauses (watch/type/
+# between-comments + propagation) overlap, so raising this multiplies throughput nearly
+# linearly — bounded by the host (CPU/RAM/one Chrome per account) and the proxy pool.
+_COMMENT_SEMAPHORE = asyncio.Semaphore(6)
 # Base: hashtag-page CAPTCHA solve + DOM scrape (~20-30s observed).
 # Per-video: new tab + navigate + CAPTCHA + type/post + full-reload persistence check
 # (with its own CAPTCHA + scroll search) — live runs measured up to ~480s for ONE video,
@@ -38,8 +47,13 @@ async def _kill_profile_chrome(account_id: int):
     'Target page, context or browser has been closed'."""
     profile = os.path.join(BROWSERS_DIR, str(account_id))
     try:
+        # Anchor the match to the profile path FOLLOWED BY a space or end-of-line. Without
+        # the anchor, `--user-data-dir=.../browsers/2` is a substring of `.../browsers/29`
+        # (and 20, 21, 2xx…), so killing account 2 would also kill accounts 20-29 — and the
+        # comment flow runs up to 6 accounts CONCURRENTLY, so one timeout would nuke other
+        # accounts' live Chrome/sessions. The trailing ( |$) makes the profile id exact.
         proc = await asyncio.create_subprocess_exec(
-            "pkill", "-9", "-f", f"--user-data-dir={profile}",
+            "pkill", "-9", "-f", f"--user-data-dir={profile}( |$)",
             stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
         )
         await proc.wait()
@@ -179,20 +193,25 @@ async def got_hashtag(message: Message, state: FSMContext):
     await state.update_data(hashtag=message.text.strip().lstrip("#"))
     await state.set_state(CommentTask.comment_text)
     await message.answer(
-        "Введи текст коментаря.\n\n"
-        "💡 Щоб уникнути shadow-фільтра TikTok, додай варіативність:\n"
-        "• <b>Кілька варіантів</b> — кожен з нового рядка (вибереться випадковий)\n"
-        "• <b>Spintax</b> — <code>{привіт|хай|вітаю}</code> розгорнеться у випадкове слово\n\n"
-        "Приклад:\n"
-        "<code>{вогонь|супер|клас}🔥 {дуже круто|топ контент}</code>",
+        "✍️ Введи текст коментаря.\n\n"
+        "Бот сам згенерує кілька схожих варіантів (AI), зберігаючи зміст — "
+        "щоб коментарі не були однакові й не чіплялись під shadow-фільтр.\n\n"
+        "💡 За бажанням можна задати варіанти вручну:\n"
+        "• кілька рядків — кожен як окремий варіант\n"
+        "• spintax: <code>{привіт|хай|вітаю}</code> → випадкове слово",
         reply_markup=cancel_kb(),
     )
 
 
 @router.message(CommentTask.comment_text, F.text)
 async def got_comment_text(message: Message, state: FSMContext):
-    await state.update_data(comment_text=message.text.strip())
+    text = message.text.strip()
+    await state.update_data(comment_text=text)
     await state.set_state(CommentTask.count)
+
+    warning = risk_warning(text)
+    if warning:
+        await message.answer(warning)
     await message.answer("На скільки відео залишити коментар? (1–10):", reply_markup=cancel_kb())
 
 
@@ -220,38 +239,70 @@ async def got_count(message: Message, state: FSMContext):
     )
     status_msg = await message.answer(f"⏳ Прогрес: <b>0/{len(account_ids)}</b>")
     _running.add(user_id)
-    asyncio.ensure_future(_run_bulk_comments(
+    from bot.bg import spawn
+    spawn(_run_bulk_comments(
         status_msg, user_id, account_ids, data["hashtag"], data["comment_text"], count
     ))
 
 
-def _browser_work_sync(acc_id, proxy, session_data, hashtag, comment_text, count, video_urls=None):
+def _browser_work_sync(acc_id, proxy, session_data, hashtag, comment_text, count, video_urls=None, username="", defer_shadowban=False):
     import asyncio as _a, tempfile, os
+    from tiktok.locks import account_session
     debug_path = tempfile.mktemp(suffix=".txt")
+    with account_session(acc_id):  # one browser per account profile at a time
+        loop = _a.new_event_loop()
+        _a.set_event_loop(loop)
+        try:
+            result = loop.run_until_complete(
+                _browser_work_async(acc_id, proxy, session_data, hashtag, comment_text, count, debug_path, video_urls, username, defer_shadowban)
+            )
+            return result, debug_path
+        finally:
+            loop.close()
+
+
+def _shadowban_sync(proxy, acc_id, username, posted):
+    """Run the guest-shadowban verification for one account's posted comments in its own
+    event loop. Called via run_in_executor AFTER the comment job released the account lock
+    + concurrency slot, so the ~40s of propagation-sleep + verify no longer blocks others.
+    Uses a guest browser (no account profile) → needs no account_session lock."""
+    import asyncio as _a
+    from tiktok.commenter import verify_posted_shadowban
     loop = _a.new_event_loop()
     _a.set_event_loop(loop)
     try:
-        result = loop.run_until_complete(
-            _browser_work_async(acc_id, proxy, session_data, hashtag, comment_text, count, debug_path, video_urls)
+        return loop.run_until_complete(
+            verify_posted_shadowban(proxy, acc_id, username, posted)
         )
-        return result, debug_path
     finally:
         loop.close()
 
 
-async def _browser_work_async(acc_id, proxy, session_data, hashtag, comment_text, count, debug_path, video_urls=None):
+async def _browser_work_async(acc_id, proxy, session_data, hashtag, comment_text, count, debug_path, video_urls=None, username="", defer_shadowban=False):
     from tiktok.browser import create_context as _cc, save_session as _ss
     from tiktok.commenter import comment_on_hashtag_videos as _cmt, block_heavy_resources as _block
 
+    from tiktok import proxy_health
     pw, ctx = None, None
+    posted: list = []  # when deferred: filled by _cmt → verified in the background later
     try:
         pw, ctx = await _cc(acc_id, proxy, session_data)
         await _block(ctx)
-        commented, debug_info = await _cmt(ctx, hashtag, comment_text, count, video_urls=video_urls)
+        commented, debug_info = await _cmt(ctx, hashtag, comment_text, count,
+                                           video_urls=video_urls, account_id=acc_id,
+                                           proxy=proxy, username=username,
+                                           defer_shadowban=defer_shadowban, posted_out=posted)
+        proxy_health.record_success(proxy)  # context + run succeeded → proxy is healthy
         saved = await _ss(ctx)
         with open(debug_path, "w") as f:
             f.write(debug_info)
-        return commented, saved
+        return commented, saved, posted
+    except Exception as e:
+        # A proxy/tunnel failure during the real run feeds the dead-proxy counter too — the
+        # tiny preflight can pass while TikTok's heavier CONNECT fails on a flaky endpoint.
+        if "ERR_TUNNEL_CONNECTION_FAILED" in str(e) or "ERR_PROXY_CONNECTION_FAILED" in str(e):
+            proxy_health.record_failure(proxy)
+        raise
     finally:
         if ctx:
             try:
@@ -267,14 +318,16 @@ async def _browser_work_async(acc_id, proxy, session_data, hashtag, comment_text
 
 def _scrape_videos_sync(acc_id, proxy, session_data, hashtag, count):
     import asyncio as _a
-    loop = _a.new_event_loop()
-    _a.set_event_loop(loop)
-    try:
-        return loop.run_until_complete(
-            _scrape_videos_async(acc_id, proxy, session_data, hashtag, count)
-        )
-    finally:
-        loop.close()
+    from tiktok.locks import account_session
+    with account_session(acc_id):
+        loop = _a.new_event_loop()
+        _a.set_event_loop(loop)
+        try:
+            return loop.run_until_complete(
+                _scrape_videos_async(acc_id, proxy, session_data, hashtag, count)
+            )
+        finally:
+            loop.close()
 
 
 async def _scrape_videos_async(acc_id, proxy, session_data, hashtag, count):
@@ -313,43 +366,91 @@ async def _run_bulk_comments(status_msg, owner_id: int, account_ids: list,
     # page is identical, wasted work (~8-30s of navigation+CAPTCHA+scroll each).
     video_urls = None
     try:
-        async with async_session_factory() as session:
-            scout = await AccountRepo(session).get_by_id(account_ids[0])
-        if scout:
-            try:
-                await status_msg.edit_text(f"🔎 Збираю список відео під #{hashtag}...")
-            except Exception:
-                pass
+        try:
+            await status_msg.edit_text(f"🔎 Збираю список відео під #{hashtag}...")
+        except Exception:
+            pass
+
+        # PRIMARY: browserless tikwm search. It's the primary source inside
+        # scrape_hashtag_videos anyway and needs no browser/proxy/CAPTCHA, so trying it
+        # here FIRST skips the scout Chrome launch entirely in the common case. Launching a
+        # full persistent context just to make this one HTTP call was the bottleneck of the
+        # "🔎 Збираю список відео" phase: ~8-15s of playwright-start + proxy geo-lookup +
+        # Chrome launch before any commenting, versus ~1.5s for the search itself.
+        from tiktok.commenter import get_videos_tikwm
+        # Pool sized for the WHOLE run, not just `count`: every account needs its own
+        # distinct videos (global claim → no two accounts share one), plus a buffer for
+        # videos that get skipped/fail downstream. Capped so a huge run can't hammer tikwm.
+        want = min(max(total * count * 3, 20), 100)
+        video_urls = await get_videos_tikwm(hashtag.lstrip("#"), want)
+
+        # FALLBACK: only when tikwm came up short do we pay for the browser DOM scrape
+        # (scrape_hashtag_videos' own fallback), run once on the scout account and shared.
+        if not video_urls or len(video_urls) < count:
             async with async_session_factory() as session:
-                scout_proxy = await AccountRepo(session).rotate_proxy(scout.id)
-            loop = asyncio.get_event_loop()
-            video_urls, scout_session = await loop.run_in_executor(
-                None, _scrape_videos_sync,
-                scout.id, scout_proxy or scout.proxy, scout.session_data, hashtag, count
-            )
-            async with async_session_factory() as session:
-                await AccountRepo(session).update_session(scout.id, scout_session)
-            try:
-                await status_msg.edit_text(
-                    f"⏳ Прогрес: <b>0/{total}</b>\n🔎 Знайдено відео: {len(video_urls or [])}"
+                scout = await AccountRepo(session).get_by_id(account_ids[0])
+            if scout:
+                async with async_session_factory() as session:
+                    scout_proxy = await AccountRepo(session).rotate_proxy(scout.id)
+                loop = asyncio.get_event_loop()
+                video_urls, scout_session = await loop.run_in_executor(
+                    None, _scrape_videos_sync,
+                    scout.id, scout_proxy or scout.proxy, scout.session_data, hashtag, count
                 )
-            except Exception:
-                pass
+                async with async_session_factory() as session:
+                    await AccountRepo(session).update_session(scout.id, scout_session)
+
+        try:
+            await status_msg.edit_text(
+                f"⏳ Прогрес: <b>0/{total}</b>\n🔎 Знайдено відео: {len(video_urls or [])}"
+            )
+        except Exception:
+            pass
     except Exception:
         video_urls = None  # fall back to per-account scraping if the shared scrape fails
+
+    async def _verify_and_autopause(acc_id: int, username: str, proxy, posted: list):
+        """Background shadowban verification for one account — runs AFTER the semaphore is
+        released, so it doesn't hold a concurrency slot during the ~40s of propagation +
+        verify. Auto-pauses an account whose verified visibility is poor."""
+        try:
+            loop = asyncio.get_event_loop()
+            # Hard cap: a guest browser stuck on a slow/dead proxy must not run forever
+            # (this is detached now, but a leaked Chrome still eats resources).
+            await asyncio.wait_for(
+                loop.run_in_executor(None, _shadowban_sync, proxy, acc_id, username, posted),
+                timeout=120,
+            )
+        except Exception:
+            pass
+        # Require a minimum verified sample so one bad/inconclusive run can't sideline a
+        # healthy account. Disabled accounts are skipped until the user re-warms.
+        try:
+            s, b, checked, pct = dedup.account_trust(acc_id)
+            if checked >= 5 and pct < 40:
+                async with async_session_factory() as session:
+                    await AccountRepo(session).set_account_active(acc_id, False)
+                await status_msg.answer(
+                    f"⏸️ <b>@{username}</b> на паузі — шедоубан "
+                    f"(видимих {pct:.0f}%, {s}/{checked}).\n"
+                    f"Прожени через 🔥 warmup і знову активуй у меню акаунта."
+                )
+        except Exception:
+            pass
 
     async def _one(acc_id: int, pre_delay: float):
         nonlocal completed
         await asyncio.sleep(pre_delay)
-        async with _COMMENT_SEMAPHORE:
-            async with async_session_factory() as session:
-                acc = await AccountRepo(session).get_by_id(acc_id)
-            if not acc:
-                results["fail"].append(f"id={acc_id}: not found")
-                return
+        async with async_session_factory() as session:
+            acc = await AccountRepo(session).get_by_id(acc_id)
+        if not acc:
+            results["fail"].append(f"id={acc_id}: not found")
+            return
 
-            task_id = None
-            try:
+        task_id = None
+        active_proxy = None
+        try:
+            async with _COMMENT_SEMAPHORE:
                 async with async_session_factory() as session:
                     task = await CommentRepo(session).create(
                         account_id=acc_id,
@@ -368,9 +469,9 @@ async def _run_bulk_comments(status_msg, owner_id: int, account_ids: list,
                 future = loop.run_in_executor(
                     None,
                     _browser_work_sync,
-                    acc.id, active_proxy or acc.proxy, acc.session_data, hashtag, comment_text, count, video_urls
+                    acc.id, active_proxy or acc.proxy, acc.session_data, hashtag, comment_text, count, video_urls, acc.username, True
                 )
-                (commented, session_data), debug_path = await asyncio.wait_for(future, timeout=timeout)
+                (commented, session_data, posted), debug_path = await asyncio.wait_for(future, timeout=timeout)
 
                 video_links = []
                 skip_reasons = []
@@ -398,26 +499,35 @@ async def _run_bulk_comments(status_msg, owner_id: int, account_ids: list,
                     await CommentRepo(session).set_status(task_id, "done")
 
                 results["ok"].append((acc.username, commented, video_links, skip_reasons))
-                await asyncio.sleep(random.uniform(20, 60))
-            except asyncio.TimeoutError:
-                await _kill_profile_chrome(acc.id)
-                if task_id:
-                    async with async_session_factory() as session:
-                        await CommentRepo(session).set_status(task_id, "failed", "timeout")
-                results["fail"].append(f"@{acc.username}: timeout")
-            except Exception as e:
-                if task_id:
-                    async with async_session_factory() as session:
-                        await CommentRepo(session).set_status(task_id, "failed", str(e))
-                results["fail"].append(f"@{acc.username}: {str(e)[:60]}")
-            finally:
-                completed += 1
-                try:
-                    await status_msg.edit_text(
-                        f"⏳ Прогрес: <b>{completed}/{total}</b>\n"
-                        f"✅ {len(results['ok'])}  ❌ {len(results['fail'])}"
-                    )
-                except Exception:
+
+            # ── semaphore released ── verify shadowban in the BACKGROUND (no slot held,
+            # and NOT awaited before the report — verdicts land in the DB/trust, and the
+            # auto-pause notice arrives whenever the check finishes).
+            if posted:
+                t = asyncio.ensure_future(
+                    _verify_and_autopause(acc_id, acc.username, active_proxy or acc.proxy, posted)
+                )
+                _BG_VERIFY_TASKS.add(t)
+                t.add_done_callback(_BG_VERIFY_TASKS.discard)
+        except asyncio.TimeoutError:
+            await _kill_profile_chrome(acc.id)
+            if task_id:
+                async with async_session_factory() as session:
+                    await CommentRepo(session).set_status(task_id, "failed", "timeout")
+            results["fail"].append(f"@{acc.username}: timeout")
+        except Exception as e:
+            if task_id:
+                async with async_session_factory() as session:
+                    await CommentRepo(session).set_status(task_id, "failed", str(e))
+            results["fail"].append(f"@{acc.username}: {str(e)[:60]}")
+        finally:
+            completed += 1
+            try:
+                await status_msg.edit_text(
+                    f"⏳ Прогрес: <b>{completed}/{total}</b>\n"
+                    f"✅ {len(results['ok'])}  ❌ {len(results['fail'])}"
+                )
+            except Exception:
                     pass
 
     try:

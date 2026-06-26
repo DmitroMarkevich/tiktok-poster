@@ -21,30 +21,40 @@ router = Router()
 _PROXY_CHECK_SEMAPHORE = asyncio.Semaphore(10)
 
 
-async def _check_proxy(proxy_str: str, timeout: float = 12.0) -> dict:
+async def _check_proxy(proxy_str: str, timeout: float = 12.0, attempts: int = 3) -> dict:
     """Test a proxy by fetching the exit IP through it (no browser needed —
     just a plain HTTP request). Returns {"ok": True, "ip", "latency_ms"} on
-    success or {"ok": False, "error"} on failure (timeout, auth, refused, etc)."""
+    success or {"ok": False, "error"} on failure (timeout, auth, refused, etc).
+
+    Retries on failure: datacenter proxies flake (the same transient ERR_TUNNEL that
+    `_goto_retry` exists for), and a SINGLE failed probe must not permanently reject a
+    working proxy — that previously rejected a live proxy in bulk-assignment with "нічого
+    не призначено". Only declares a proxy dead if EVERY attempt fails."""
     proxy_server, credentials = _parse_proxy(proxy_str)
     if not proxy_server or proxy_server.startswith(":"):
         return {"ok": False, "error": "не вдалось розпарсити адресу"}
 
     proxy_url = f"http://{proxy_server}"
     proxy_auth = aiohttp.BasicAuth(credentials["username"], credentials["password"]) if credentials else None
-    start = time.monotonic()
-    try:
-        async with _PROXY_CHECK_SEMAPHORE:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(
-                    "https://api.ipify.org?format=json",
-                    proxy=proxy_url, proxy_auth=proxy_auth,
-                    timeout=aiohttp.ClientTimeout(total=timeout),
-                ) as resp:
-                    data = await resp.json(content_type=None)
-                    latency_ms = round((time.monotonic() - start) * 1000)
-                    return {"ok": True, "ip": data.get("ip"), "latency_ms": latency_ms}
-    except Exception as e:
-        return {"ok": False, "error": str(e)[:70]}
+    last_err = "no response"
+    for attempt in range(attempts):
+        start = time.monotonic()
+        try:
+            async with _PROXY_CHECK_SEMAPHORE:
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(
+                        "https://api.ipify.org?format=json",
+                        proxy=proxy_url, proxy_auth=proxy_auth,
+                        timeout=aiohttp.ClientTimeout(total=timeout),
+                    ) as resp:
+                        data = await resp.json(content_type=None)
+                        latency_ms = round((time.monotonic() - start) * 1000)
+                        return {"ok": True, "ip": data.get("ip"), "latency_ms": latency_ms}
+        except Exception as e:
+            last_err = str(e)[:70]
+            if attempt < attempts - 1:
+                await asyncio.sleep(1.5)
+    return {"ok": False, "error": last_err}
 
 
 @router.callback_query(F.data == "proxies")
@@ -385,21 +395,11 @@ async def handle_proxy_list(message: Message, state: FSMContext):
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _normalize_proxy(raw: str) -> str:
-    """Accept both `http://user:pass@host:port` and the common `host:port:user:pass`
-    / `host:port` list-export formats and convert to the URL form `_parse_proxy`
-    (browser.py, urlparse-based) actually understands. Without this, a raw
-    `host:port:user:pass` string parses as garbage (hostname=None) → ERR_TUNNEL_CONNECTION_FAILED."""
-    raw = raw.strip()
-    if raw.startswith("http"):
-        return raw
-    parts = raw.split(":")
-    if len(parts) == 4:
-        host, port, user, pwd = parts
-        return f"http://{user}:{pwd}@{host}:{port}"
-    elif len(parts) == 2:
-        host, port = parts
-        return f"http://{host}:{port}"
-    return raw
+    """Canonicalise a proxy string to URL form. Thin wrapper over the single source of
+    truth in browser.py (which `_parse_proxy` now also calls) so every entry path and the
+    browser launch agree on the format."""
+    from tiktok.browser import normalize_proxy
+    return normalize_proxy(raw) or raw
 
 
 def _parse_proxy_lines(raw: str) -> list:

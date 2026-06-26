@@ -11,6 +11,10 @@ from .proxies import router as proxies_router
 from .stats import router as stats_router
 from .settings import router as settings_router
 from .admins import router as admins_router
+from .warmup import router as warmup_router
+from .autopilot import router as autopilot_router
+from .status import router as status_router
+from .outlook import router as outlook_router
 
 main_router = Router()
 
@@ -21,6 +25,10 @@ main_router.include_router(comments_router)
 main_router.include_router(proxies_router)
 main_router.include_router(stats_router)
 main_router.include_router(settings_router)
+main_router.include_router(warmup_router)
+main_router.include_router(autopilot_router)
+main_router.include_router(status_router)
+main_router.include_router(outlook_router)
 
 
 @main_router.message(CommandStart())

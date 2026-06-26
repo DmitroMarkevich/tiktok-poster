@@ -51,8 +51,14 @@ _PIECE_SELECTORS = [
     "[class*='slide-piece'] img",
 ]
 
-# Slider button / drag handle
+# Slider button / drag handle.
+# 2024+ TikTok captcha redesign uses id="captcha_slide_button" + a draggable
+# div.cap-absolute inside a cap-rounded-full track — added first so the new layout
+# is matched before the legacy secsdk selectors.
 _SLIDER_SELECTORS = [
+    "#captcha_slide_button",
+    "[draggable='true'][class*='cap-absolute']",
+    "button[id*='slide']",
     "[class*='secsdk-captcha-drag-icon']",
     "[class*='captcha_verify_slide_bar']",
     "[class*='drag-icon']:not(img)",
@@ -60,6 +66,17 @@ _SLIDER_SELECTORS = [
     "[class*='drag-btn']",
     "[class*='slide-btn']",
 ]
+
+# Rotation-captcha attempt budgets. A brute-force grid can't feasibly cover the small
+# (<8px) acceptance window, so solving hinges on a good CV estimate:
+#   • high-confidence estimate → fine search, up to _MAX attempts (solves in 1-3).
+#   • low-confidence estimate  → a few quick guesses then bail and skip the video, so a
+#     bad estimate costs ~15s, not a full ~57-118s sweep.
+# _ROTATION_CONF_HIGH is the peak-sharpness threshold (offline-validated: a live solve
+# had sharpness 5.2, a live failure 3.3).
+_ROTATION_MAX_ATTEMPTS = 16
+_ROTATION_LOWCONF_ATTEMPTS = 4
+_ROTATION_CONF_HIGH = 4.0
 
 # URL patterns that identify CAPTCHA image requests
 _CAPTCHA_URL_PATTERNS = (
@@ -88,6 +105,12 @@ async def solve_captcha_if_present(
 
         captcha_type = await _detect_captcha_type(page, captcha_frame)
 
+        # Always snapshot the captcha images up front (regardless of type / whether the
+        # solve later succeeds) so we can tune the solver on real samples.
+        await _save_captcha_images(page, captcha_frame, label=captcha_type)
+        # TEMP: dump DOM so we can fix _img_scope when a captcha layout slips it.
+        await _dump_captcha_dom(captcha_frame, captcha_el, label=captcha_type)
+
         if captcha_type == "rotation":
             solved = await _solve_rotation(page, captcha_frame)
         else:
@@ -96,11 +119,19 @@ async def solve_captcha_if_present(
             if offset is not None:
                 solved = await _apply_offset(page, captcha_frame, offset)
             elif api_key:
+                # Paid fallback. An invalid/expired key makes the service raise
+                # (e.g. ERROR_KEY_DOES_NOT_EXIST) — swallow it so a dead key never
+                # kills the whole solve; we just fall through to solved=False and
+                # let the OpenCV-only retries run.
                 screenshot_b64 = await _screenshot_b64(captcha_el, page)
-                if service == "capsolver":
-                    offset = await _capsolver_solve(screenshot_b64, api_key)
-                else:
-                    offset = await _twocaptcha_solve(screenshot_b64, api_key)
+                try:
+                    if service == "capsolver":
+                        offset = await _capsolver_solve(screenshot_b64, api_key)
+                    else:
+                        offset = await _twocaptcha_solve(screenshot_b64, api_key)
+                except Exception as e:
+                    print(f"[captcha] paid solver ({service}) failed: {e}", flush=True)
+                    offset = None
                 solved = await _apply_offset(page, captcha_frame, offset) if offset else False
             else:
                 solved = False
@@ -114,13 +145,122 @@ async def solve_captcha_if_present(
     return False
 
 
+def _img_scope(captcha_frame):
+    """Locator for images INSIDE the captcha widget only. Critical: the video page
+    has avatars/thumbnails (e.g. 720×720) that are LARGER than the captcha images
+    (~347/211), so an unscoped 'img' query picks the wrong ones → wrong captcha-type
+    detection and garbage rotation estimates."""
+    return captcha_frame.locator(
+        ".captcha-verify-container img, #captcha-verify-container-main-page img, "
+        "[class*='captcha-verify'] img, [class*='secsdk-captcha'] img"
+    )
+
+
+async def _scoped_captcha_images(captcha_frame, wait_ms: int = 2500):
+    """Image element handles inside the captcha widget; falls back to all page
+    images only if the scoped query never reaches two.
+
+    Polls up to wait_ms because _find_captcha matches the captcha CONTAINER as soon
+    as it appears, but the widget's own <img> elements paint a beat later. Querying
+    immediately finds 0-1 captcha images → falls back to page avatars/thumbnails →
+    the rotation captcha gets misclassified as 'slider' and never reaches the free
+    OpenCV solver. Waiting for the real images fixes that without any paid service."""
+    for _ in range(max(1, wait_ms // 250)):
+        try:
+            imgs = await _img_scope(captcha_frame).all()
+            if len(imgs) >= 2:
+                return imgs
+        except Exception:
+            pass
+        await asyncio.sleep(0.25)
+    return await captcha_frame.locator("img").all()
+
+
+async def _dump_captcha_dom(captcha_frame, captcha_el, label: str = "captcha") -> None:
+    """TEMP DIAGNOSTIC: dump the captcha container's HTML + every <img> (inside the
+    widget AND in the whole frame) with class/id/natural size/src to
+    /tmp/captcha_debug/<ts>_<label>_dom.txt. Lets us discover the real <img>
+    selectors when _img_scope picks page junk instead of the captcha images.
+    Best-effort; remove once scoping covers all captcha layouts."""
+    try:
+        import os, time
+        out_dir = "/tmp/captcha_debug"
+        os.makedirs(out_dir, exist_ok=True)
+        ts = int(time.time())
+        lines = []
+        try:
+            html = await captcha_el.evaluate("el => el.outerHTML.slice(0, 6000)")
+            lines.append("=== CONTAINER outerHTML (6k) ===")
+            lines.append(html)
+        except Exception as e:
+            lines.append(f"[container html failed: {e}]")
+
+        js = (
+            "els => Array.from(els).map(i => JSON.stringify({"
+            "cls: i.className, id: i.id, w: i.naturalWidth, h: i.naturalHeight,"
+            "src: (i.src||'').slice(0,90)}))"
+        )
+        try:
+            inside = await captcha_el.evaluate(f"el => ({js})(el.querySelectorAll('img'))")
+            lines.append(f"\n=== <img> INSIDE container ({len(inside)}) ===")
+            lines.extend(inside)
+        except Exception as e:
+            lines.append(f"[container img enum failed: {e}]")
+        try:
+            allimg = await captcha_frame.evaluate(f"() => ({js})(document.querySelectorAll('img'))")
+            lines.append(f"\n=== ALL <img> in frame ({len(allimg)}) ===")
+            lines.extend(allimg)
+        except Exception as e:
+            lines.append(f"[frame img enum failed: {e}]")
+
+        path = f"{out_dir}/{ts}_{label}_dom.txt"
+        with open(path, "w") as f:
+            f.write("\n".join(lines))
+        print(f"[captcha] dumped DOM → {path}", flush=True)
+    except Exception:
+        pass
+
+
+async def _save_captcha_images(page: Page, captcha_frame, label: str = "captcha") -> None:
+    """Save every visible captcha image to /tmp/captcha_debug (best-effort). Runs as
+    soon as a captcha is detected so we always capture real samples for solver tuning."""
+    try:
+        import os, time
+        out_dir = "/tmp/captcha_debug"
+        os.makedirs(out_dir, exist_ok=True)
+        ts = int(time.time())
+        n = 0
+        for el in await _scoped_captcha_images(captcha_frame):
+            try:
+                if not await el.is_visible(timeout=300):
+                    continue
+                src = await el.get_attribute("src") or ""
+                if not src:
+                    continue
+                if src.startswith("data:"):
+                    raw = base64.b64decode(src.split(",", 1)[1])
+                else:
+                    resp = await page.request.get(src)
+                    raw = await resp.body() if resp.ok else None
+                if raw:
+                    with open(f"{out_dir}/{ts}_{label}_{n}.webp", "wb") as f:
+                        f.write(raw)
+                    n += 1
+            except Exception:
+                continue
+        if n:
+            print(f"[captcha] saved {n} image(s) → {out_dir}/{ts}_{label}_*.webp", flush=True)
+    except Exception:
+        pass
+
+
 async def _detect_captcha_type(page: Page, captcha_frame) -> str:
     """Returns 'rotation' or 'slider'.
     Rotation: two concentric images (same center, different sizes).
     Slider:   two images side by side.
     """
     try:
-        imgs = await captcha_frame.locator("img").all()
+        imgs = await _scoped_captcha_images(captcha_frame)
         boxes = []
         for img in imgs:
             try:
@@ -151,13 +291,10 @@ async def _detect_captcha_type(page: Page, captcha_frame) -> str:
     return "slider"
 
 
-async def _solve_rotation(page: Page, captcha_frame) -> bool:
-    """
-    Solve TikTok rotation CAPTCHA.
-    Gets fresh slider position before each drag (TikTok resets it after wrong answer).
-    """
-    # Find slider element (keep reference, not just box)
-    slider_el = None
+async def _find_rotation_slider(captcha_frame):
+    """Locate the rotation captcha's small drag handle (width < 100). Returns a
+    locator or None. Used both initially and to RE-ACQUIRE the slider after TikTok
+    reloads the captcha mid-sweep (the old slider detaches → a fresh one renders)."""
     for sel in _SLIDER_SELECTORS + [
         "[class*='captcha'] button[class*='default']",
         "[class*='verify'] button[class*='default']",
@@ -165,18 +302,25 @@ async def _solve_rotation(page: Page, captcha_frame) -> bool:
         try:
             el = captcha_frame.locator(sel).first
             if await el.is_visible(timeout=600):
-                box = await el.bounding_box()
+                box = await el.bounding_box(timeout=2000)
                 if box and box["width"] < 100:
-                    slider_el = el
-                    break
+                    return el
         except Exception:
             continue
+    return None
 
+
+async def _solve_rotation(page: Page, captcha_frame) -> bool:
+    """
+    Solve TikTok rotation CAPTCHA.
+    Gets fresh slider position before each drag (TikTok resets it after wrong answer).
+    """
+    slider_el = await _find_rotation_slider(captcha_frame)
     if not slider_el:
         print("[captcha] _solve_rotation: slider element NOT found")
         return False
 
-    initial_box = await slider_el.bounding_box()
+    initial_box = await slider_el.bounding_box(timeout=3000)
     if not initial_box:
         print("[captcha] _solve_rotation: slider bounding_box() is None")
         return False
@@ -189,36 +333,82 @@ async def _solve_rotation(page: Page, captcha_frame) -> bool:
     # spaced fallback positions ORDERED BY DISTANCE from that estimate. If OpenCV is
     # close but not pixel-exact, the correct position is now hit in 1-3 tries instead
     # of the old linear 1→35 sweep (which once landed only on attempt 32, ~100s).
-    fraction = await _rotation_fraction_opencv(page, captcha_frame)
-    print(f"[captcha] opencv fraction={fraction}")
-    steps = list(range(1, 36))  # 2.78% intervals (~8px steps on a 284px track)
-    if fraction is not None:
-        center = max(1, min(35, round(fraction * 36)))
-        steps.sort(key=lambda s: abs(s - center))
-    fracs = ([fraction] if fraction is not None else []) + [s / 36 for s in steps]
+    fraction, conf = await _rotation_fraction_opencv(page, captcha_frame)
+    print(f"[captcha] opencv fraction={fraction} conf={conf:.1f}")
+
+    # Strategy by CONFIDENCE (offline-validated: peak sharpness predicts correctness).
+    # The acceptance window is < ~8px, so a brute-force grid would need ~70 positions to
+    # guarantee a hit — too slow. Reliable solving therefore depends on a GOOD estimate:
+    #   • high conf → fine ~3px search around the estimate + its mirror (the CV gives the
+    #     angle, not the drag direction), capped low → solves in 1-3 tries.
+    #   • low conf  → the estimate can't be trusted and brute force won't pay off, so try
+    #     only a few cheap guesses then bail FAST and skip the video (plenty more exist).
+    px = 1.0 / max(track_width, 1.0)               # one pixel as a fraction of the track
+    if fraction is not None and conf >= _ROTATION_CONF_HIGH:
+        centers = [fraction % 1.0, (1.0 - fraction) % 1.0]
+        fine_px = (0, 3, -3, 6, -6, 9, -9, 12, -12)   # land inside the window
+        fracs = [(c + off * px) % 1.0 for c in centers for off in fine_px]
+        cap = _ROTATION_MAX_ATTEMPTS
+    else:
+        # Untrusted estimate: a handful of quick guesses (estimate, mirror, a couple of
+        # neighbours) then give up — don't burn a full sweep on a bad lead.
+        if fraction is not None:
+            centers = [fraction % 1.0, (1.0 - fraction) % 1.0]
+            fracs = [(c + off * px) % 1.0 for c in centers for off in (0, 4, -4)]
+        else:
+            fracs = [s / 36 for s in range(1, 36)]   # no estimate at all → even sweep
+        cap = _ROTATION_LOWCONF_ATTEMPTS
+    # Drop near-duplicates (< ~2px apart) and cap the attempt budget.
+    seen_fr, deduped = [], []
+    for fr in fracs:
+        if all(abs(fr - p) > 2.0 * px for p in seen_fr):
+            seen_fr.append(fr)
+            deduped.append(fr)
+    fracs = deduped[:cap]
+    print(f"[captcha] strategy={'fine' if (fraction is not None and conf >= _ROTATION_CONF_HIGH) else 'lowconf-bail'} attempts={len(fracs)}")
 
     for i, frac in enumerate(fracs):
-        # Get FRESH slider position after each reset
-        box = await slider_el.bounding_box()
+        # Get FRESH slider position after each reset. Short timeout: a detached slider
+        # must fail in ~3s, not block on Playwright's 30s default and crash the post.
+        try:
+            box = await slider_el.bounding_box(timeout=3000)
+        except Exception:
+            box = None
         if not box:
-            print(f"[captcha] attempt {i}: bounding_box() is None (detached?)")
-            break
+            # Slider vanished. Either the captcha closed (solved) or it reloaded after
+            # several wrong drags (old handle detaches, a fresh one renders). Don't
+            # crash the whole sweep — check which, and re-acquire if it's a reload.
+            _, still = await _find_captcha(page)
+            if not still:
+                print(f"[captcha] SOLVED (slider gone) after attempt {i}")
+                return True
+            slider_el = await _find_rotation_slider(captcha_frame)
+            if slider_el is None:
+                print(f"[captcha] attempt {i}: slider lost, captcha still present — abort")
+                break
+            try:
+                box = await slider_el.bounding_box(timeout=3000)
+            except Exception:
+                box = None
+            if not box:
+                print(f"[captcha] attempt {i}: re-acquired slider has no box — abort")
+                break
         sx = box["x"] + box["width"] / 2
         sy = box["y"] + box["height"] / 2
         target_x = sx + track_width * frac
         print(f"[captcha] attempt {i}: frac={frac:.3f} drag {sx:.0f}→{target_x:.0f} (delta={target_x-sx:.0f}px)")
 
         await _human_drag(page, sx, sy, target_x, sy)
-        await asyncio.sleep(1.4)
+        await asyncio.sleep(0.8)
 
         _, still = await _find_captcha(page)
         if not still:
             print(f"[captcha] SOLVED on attempt {i} (frac={frac:.3f})")
             return True
 
-        await asyncio.sleep(0.9)  # wait for TikTok auto-reset animation
+        await asyncio.sleep(0.4)  # wait for TikTok auto-reset animation
 
-    print("[captcha] _solve_rotation: all fractions exhausted, failed")
+    print(f"[captcha] _solve_rotation: {len(fracs)} attempts exhausted, failed")
     return False
 
 
@@ -254,8 +444,8 @@ async def _rotation_fraction_opencv(page: Page, captcha_frame) -> Optional[float
     the inner rotating piece against the outer background ring.
     Returns fraction [0,1] of slider to drag, or None on failure.
     """
-    # Collect all visible images with their sizes
-    all_imgs = await captcha_frame.locator("img").all()
+    # Collect captcha images (scoped to the widget — page avatars can be larger).
+    all_imgs = await _scoped_captcha_images(captcha_frame)
     img_data = []
     for el in all_imgs:
         try:
@@ -279,8 +469,8 @@ async def _rotation_fraction_opencv(page: Page, captcha_frame) -> Optional[float
     if len(img_data) < 2:
         if len(img_data) == 1:
             raw = img_data[0][1]
-            return _gradient_upright_fraction(raw)
-        return None
+            return _gradient_upright_fraction(raw), 0.0
+        return None, 0.0
 
     # Sort by area: larger = background ring, smaller = rotating piece
     img_data.sort(key=lambda x: x[0], reverse=True)
@@ -308,71 +498,98 @@ async def _rotation_fraction_opencv(page: Page, captcha_frame) -> Optional[float
         bg = cv2.imdecode(np.frombuffer(bg_bytes, np.uint8), cv2.IMREAD_COLOR)
         piece = cv2.imdecode(np.frombuffer(piece_bytes, np.uint8), cv2.IMREAD_COLOR)
         if bg is None or piece is None:
-            return None
-
-        ph, pw = piece.shape[:2]
-        bh, bw = bg.shape[:2]
-
-        # The background ring has a white hole in the center; the piece is the
-        # content that belongs in that hole, rotated. Match them by their angular
-        # colour profile near the piece/hole boundary.
-        #
-        # KEY FIX: average over a BAND of radii instead of a single 1px ring. A
-        # one-pixel ring is noisy and routinely picked the wrong angle, which is
-        # what forced the slow 36-step brute force. Averaging ~12 radii produces a
-        # far sharper, more reliable minimum. Also step every 1° (not 2°).
-        bg_cx, bg_cy = bw // 2, bh // 2
-        piece_cx, piece_cy = pw // 2, ph // 2
-        piece_r = min(pw, ph) // 2 - 2
-
-        n_angles = 360
-
-        def _angular_profile(img, cx, cy, radii):
-            h, w = img.shape[:2]
-            prof = np.zeros((n_angles, 3), np.float32)
-            for k in range(n_angles):
-                rad = 2 * np.pi * k / n_angles
-                xs = np.clip((cx + radii * np.cos(rad)).astype(int), 0, w - 1)
-                ys = np.clip((cy + radii * np.sin(rad)).astype(int), 0, h - 1)
-                prof[k] = img[ys, xs].mean(axis=0)
-            return prof
-
-        # The background has a white hole of radius ≈ piece_r in its centre, so sample
-        # the bg band just OUTSIDE the hole (real ring content), and the piece band
-        # just INSIDE its edge. Sampling both at the same radii would read the bg's
-        # white hole and wash the signal out entirely.
-        radii_bg = np.arange(piece_r + 2, piece_r + 14)
-        radii_pc = np.arange(max(3, piece_r - 14), piece_r - 2)
-        bg_ring = _angular_profile(bg, bg_cx, bg_cy, radii_bg)
-        piece_ring = _angular_profile(piece, piece_cx, piece_cy, radii_pc)
-
-        # Remove per-channel brightness offset so the match is about pattern, not
-        # overall exposure differences between the two rendered images.
-        bg_ring -= bg_ring.mean(axis=0)
-        piece_ring -= piece_ring.mean(axis=0)
-
-        best_angle = 0
-        best_score = float("inf")
-        scores = []
-        for deg in range(0, 360):
-            rotated_ring = np.roll(piece_ring, deg, axis=0)
-            diff = float(np.mean(np.abs(bg_ring - rotated_ring)))
-            scores.append((diff, deg))
-            if diff < best_score:
-                best_score = diff
-                best_angle = deg
-
-        scores.sort()
-        top5 = [(f"{d}°", f"{s:.1f}") for s, d in scores[:5]]
-        print(f"[captcha] opencv boundary top5: {top5} (best={best_angle}°)")
-
-        return best_angle / 360.0
+            return None, 0.0
+        deg, conf = estimate_rotation_degrees(bg, piece)
+        if deg is None:
+            return None, 0.0
+        print(f"[captcha] opencv estimate: {deg:.1f}° → frac={deg / 360.0:.3f} conf={conf:.1f}")
+        return (deg % 360) / 360.0, conf
 
     except ImportError:
-        return None
+        return None, 0.0
     except Exception as e:
         print(f"[captcha] opencv error: {e}")
-        return None
+        return None, 0.0
+
+
+def _angular_profiles(img, cx, cy, radii):
+    """Sample image along concentric circles → (intensity[360], edge[360]) profiles,
+    each averaged over the radii band. Edge profile = Sobel gradient magnitude
+    (alignment of edges is a strong, brightness-invariant cue)."""
+    import cv2
+    import numpy as np
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+    edge = cv2.magnitude(gx, gy)
+    h, w = gray.shape
+    n = 360
+    inten = np.zeros(n, np.float32)
+    edg = np.zeros(n, np.float32)
+    for k in range(n):
+        rad = 2 * np.pi * k / n
+        xs = np.clip((cx + radii * np.cos(rad)).astype(int), 0, w - 1)
+        ys = np.clip((cy + radii * np.sin(rad)).astype(int), 0, h - 1)
+        inten[k] = gray[ys, xs].mean()
+        edg[k] = edge[ys, xs].mean()
+    return inten, edg
+
+
+def _norm(a):
+    import numpy as np
+    a = a - a.mean()
+    s = a.std()
+    return a / s if s > 1e-6 else a
+
+
+def _circular_xcorr(a, b):
+    """Circular cross-correlation via FFT. Returns cc[θ] = how well b rotated by θ
+    matches a. O(n log n) — far better than the old O(n²) MAD sweep."""
+    import numpy as np
+    A = np.fft.rfft(a)
+    B = np.fft.rfft(b)
+    return np.fft.irfft(A * np.conj(B), n=len(a))
+
+
+def estimate_rotation_degrees(bg, piece):
+    """Returns (degrees 0..360, confidence) — the rotation the inner piece must turn
+    to align with the background ring, plus a peak-sharpness confidence score.
+    Multi-feature (intensity + edge) circular cross-correlation, band-averaged, with
+    parabolic sub-degree refinement. Returns (None, 0.0) if the piece is too small.
+
+    Pure function over two BGR arrays so it can be unit-tested on synthetic data.
+    """
+    import numpy as np
+    bh, bw = bg.shape[:2]
+    ph, pw = piece.shape[:2]
+    bg_cx, bg_cy = bw / 2.0, bh / 2.0
+    pc_cx, pc_cy = pw / 2.0, ph / 2.0
+    piece_r = min(pw, ph) // 2 - 2
+    if piece_r < 8:
+        return None, 0.0
+
+    # bg sampled just OUTSIDE the white hole; piece just INSIDE its edge.
+    radii_bg = np.arange(piece_r + 2, piece_r + 16)
+    radii_pc = np.arange(max(3, piece_r - 16), piece_r - 2)
+
+    bg_int, bg_edge = _angular_profiles(bg, bg_cx, bg_cy, radii_bg)
+    pc_int, pc_edge = _angular_profiles(piece, pc_cx, pc_cy, radii_pc)
+
+    # Sum normalized cross-correlations of both features → sharp, robust peak.
+    cc = _circular_xcorr(_norm(bg_int), _norm(pc_int)) + \
+        _circular_xcorr(_norm(bg_edge), _norm(pc_edge))
+
+    peak = int(np.argmax(cc))
+    # Peak-to-mean ratio = how sharp/confident the alignment is. Offline-validated
+    # against live solves: high sharpness → the estimate is right (solves in 1-2 tries);
+    # low → ambiguous, low-texture boundary → estimate unreliable. The caller uses it to
+    # decide whether to trust the estimate or skip the captcha fast.
+    sharpness = float(cc.max() / (np.abs(cc).mean() + 1e-9))
+    # Parabolic interpolation around the peak for sub-degree precision.
+    y0, y1, y2 = cc[(peak - 1) % 360], cc[peak], cc[(peak + 1) % 360]
+    denom = (y0 - 2 * y1 + y2)
+    delta = 0.5 * (y0 - y2) / denom if abs(denom) > 1e-9 else 0.0
+    return float((peak + delta) % 360.0), sharpness  # plain float — never leak np.float32
 
 
 def _gradient_upright_fraction(img_bytes: bytes) -> Optional[float]:
@@ -571,6 +788,11 @@ async def _human_drag(
     page: Page, x1: float, y1: float, x2: float, y2: float
 ) -> None:
     """Ease-out cubic drag with per-step micro-jitter (looks human)."""
+    # Coerce to plain Python floats. Rotation fractions flow from numpy
+    # (estimate_rotation_degrees), so x/y can arrive as np.float32 — which Playwright
+    # cannot JSON-serialize ("Object of type float32 is not JSON serializable"),
+    # crashing every rotation-captcha drag and silently failing the whole post.
+    x1, y1, x2, y2 = float(x1), float(y1), float(x2), float(y2)
     steps = 45 + random.randint(0, 20)
     await page.mouse.move(x1, y1)
     await asyncio.sleep(0.2 + random.uniform(0, 0.12))

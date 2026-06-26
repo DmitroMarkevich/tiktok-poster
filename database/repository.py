@@ -1,9 +1,9 @@
 from __future__ import annotations
 import json
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, update, func
-from .models import Account, UploadTask, CommentTask, BotUser
+from .models import Account, UploadTask, CommentTask, BotUser, CommentedVideo, AutopilotState
 
 
 class AccountRepo:
@@ -42,6 +42,24 @@ class AccountRepo:
     async def update_session(self, account_id: int, session_data: str):
         await self.session.execute(
             update(Account).where(Account.id == account_id).values(session_data=session_data)
+        )
+        await self.session.commit()
+
+    async def set_account_active(self, account_id: int, active: bool):
+        """Enable/disable a single account. Disabled accounts are skipped by
+        list_by_owner (which filters is_active==True) — used to auto-pause an account
+        whose comments keep getting shadowbanned until the user re-warms it."""
+        await self.session.execute(
+            update(Account).where(Account.id == account_id).values(is_active=active)
+        )
+        await self.session.commit()
+
+    async def mark_warmed(self, account_id: int):
+        await self.session.execute(
+            update(Account).where(Account.id == account_id).values(
+                last_warmup_at=datetime.utcnow(),
+                warmup_count=Account.warmup_count + 1,
+            )
         )
         await self.session.commit()
 
@@ -184,6 +202,93 @@ class CommentRepo:
             update(CommentTask).where(CommentTask.id == task_id).values(**values)
         )
         await self.session.commit()
+
+
+class AnalyticsRepo:
+    """Per-account CRM metrics, computed from the existing tables (no separate
+    tracker DB). Comment counts come from `commented_videos` (one row per
+    successfully posted comment), warmup data from `accounts`."""
+
+    def __init__(self, session: AsyncSession):
+        self.session = session
+
+    async def account_dashboard(self, owner_id: int) -> list[dict]:
+        # Comments per account (successful posts recorded in commented_videos).
+        rows = await self.session.execute(
+            select(Account, func.count(CommentedVideo.id))
+            .outerjoin(CommentedVideo, CommentedVideo.account_id == Account.id)
+            .where(Account.owner_id == owner_id, Account.is_active == True)
+            .group_by(Account.id)
+        )
+        out = []
+        for acc, comment_count in rows.all():
+            out.append({
+                "username": acc.username,
+                "uploads": acc.upload_count or 0,
+                "comments": comment_count or 0,
+                "warmups": acc.warmup_count or 0,
+                "last_warmup": acc.last_warmup_at,
+                "has_session": bool(acc.session_data),
+                "has_proxy": bool(acc.proxy),
+            })
+        out.sort(key=lambda d: (d["comments"] + d["uploads"]), reverse=True)
+        return out
+
+    async def comment_summary(self, owner_id: int) -> dict:
+        async def _count(since: datetime | None) -> int:
+            q = (
+                select(func.count(CommentedVideo.id))
+                .join(Account, Account.id == CommentedVideo.account_id)
+                .where(Account.owner_id == owner_id)
+            )
+            if since is not None:
+                q = q.where(CommentedVideo.created_at >= since)
+            return (await self.session.execute(q)).scalar() or 0
+
+        now = datetime.utcnow()
+        today_start = datetime.combine(date.today(), datetime.min.time())
+        return {
+            "total": await _count(None),
+            "today": await _count(today_start),
+            "week": await _count(now - timedelta(days=7)),
+        }
+
+
+class AutopilotRepo:
+    """Persisted autopilot config so a running autopilot survives a bot restart."""
+
+    def __init__(self, session: AsyncSession):
+        self.session = session
+
+    async def save(self, owner_id: int, chat_id: int, cfg: dict, active: bool = True):
+        existing = await self.session.get(AutopilotState, owner_id)
+        if existing:
+            existing.chat_id = chat_id
+            existing.hashtag = cfg["hashtag"]
+            existing.comment_text = cfg["comment_text"]
+            existing.count = cfg["count"]
+            existing.warmup_min = cfg["warmup_min"]
+            existing.active = active
+            existing.updated_at = datetime.utcnow()
+        else:
+            self.session.add(AutopilotState(
+                owner_id=owner_id, chat_id=chat_id, hashtag=cfg["hashtag"],
+                comment_text=cfg["comment_text"], count=cfg["count"],
+                warmup_min=cfg["warmup_min"], active=active,
+            ))
+        await self.session.commit()
+
+    async def set_active(self, owner_id: int, active: bool):
+        await self.session.execute(
+            update(AutopilotState).where(AutopilotState.owner_id == owner_id).values(active=active)
+        )
+        await self.session.commit()
+
+    async def list_active(self) -> list[AutopilotState]:
+        r = await self.session.execute(
+            select(AutopilotState).where(AutopilotState.active == True)
+        )
+        return list(r.scalars().all())
 
 
 class BotUserRepo:

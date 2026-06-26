@@ -8,6 +8,8 @@ from aiogram.types import BotCommand
 from config import BOT_TOKEN
 from database import init_db
 from bot.handlers import main_router
+from bot.handlers.autopilot import resume_autopilots
+from bot.health import session_health_loop
 from bot.middlewares import RoleMiddleware
 
 
@@ -29,6 +31,12 @@ async def main():
     ])
 
     await bot.delete_webhook(drop_pending_updates=True)
+
+    # Background tasks: resume any autopilot that was running before restart, and
+    # periodically check account session health.
+    asyncio.ensure_future(resume_autopilots(bot))
+    asyncio.ensure_future(session_health_loop(bot))
+
     await dp.start_polling(bot)
 
 

@@ -10,7 +10,7 @@ from bot.keyboards import accounts_menu, accounts_list_kb, account_actions_kb, c
 from database import async_session_factory
 from database.repository import AccountRepo, UploadRepo
 from tiktok.browser import create_context, save_session
-from tiktok.auth import verify_logged_in
+from tiktok.auth import verify_logged_in_robust
 
 router = Router()
 
@@ -183,11 +183,20 @@ async def check_login(callback: CallbackQuery):
         )
         return
 
+    from tiktok.locks import get_account_lock
+    lock = get_account_lock(acc.id)
+    if not lock.acquire(blocking=False):
+        await callback.message.edit_text(
+            f"🔌 @{acc.username} зараз зайнятий іншою задачею — спробуй пізніше.",
+            reply_markup=account_actions_kb(account_id)
+        )
+        return
+
     pw, ctx = None, None
     try:
         pw, ctx = await create_context(acc.id, acc.proxy, acc.session_data)
 
-        if await verify_logged_in(ctx):
+        if await verify_logged_in_robust(ctx):
             await callback.message.edit_text(
                 f"✅ @{acc.username} — сесія активна.",
                 reply_markup=account_actions_kb(account_id)
@@ -204,6 +213,7 @@ async def check_login(callback: CallbackQuery):
     finally:
         if ctx: await ctx.close()
         if pw:  await pw.stop()
+        lock.release()
 
 
 @router.callback_query(F.data == "account_check_all")
@@ -218,25 +228,34 @@ async def check_all_sessions(callback: CallbackQuery):
     msg = await callback.message.edit_text(
         f"⏳ Перевіряю сесії {len(accounts)} акаунтів..."
     )
-    asyncio.create_task(_bulk_check_sessions(msg, accounts))
+    from bot.bg import spawn
+    spawn(_bulk_check_sessions(msg, accounts))
 
 
 async def _bulk_check_sessions(msg, accounts: list):
+    from tiktok.locks import get_account_lock
     sem = asyncio.Semaphore(2)
-    results = {"ok": [], "invalid": [], "failed": []}
+    results = {"ok": [], "invalid": [], "failed": [], "busy": []}
     total = len(accounts)
     done = 0
 
     async def _check_one(acc):
         nonlocal done
         async with sem:
+            # Skip accounts whose profile is in use (commenting/warmup) — launching a
+            # second Chrome on the same profile corrupts the live session.
+            lock = get_account_lock(acc.id)
+            if not lock.acquire(blocking=False):
+                results["busy"].append(acc.username)
+                done += 1
+                return
             pw, ctx = None, None
             try:
                 if not acc.session_data:
                     results["invalid"].append(f"@{acc.username}: немає cookies")
                     return
                 pw, ctx = await create_context(acc.id, acc.proxy, acc.session_data)
-                if await verify_logged_in(ctx):
+                if await verify_logged_in_robust(ctx):
                     results["ok"].append(acc.username)
                 else:
                     results["invalid"].append(f"@{acc.username}: сесія недійсна")
@@ -245,12 +264,14 @@ async def _bulk_check_sessions(msg, accounts: list):
             finally:
                 if ctx: await ctx.close()
                 if pw:  await pw.stop()
+                lock.release()
                 done += 1
                 try:
                     await msg.edit_text(
                         f"⏳ Перевіряю [{done}/{total}]...\n"
                         f"✅ {len(results['ok'])}  "
                         f"⚠️ {len(results['invalid'])}  "
+                        f"🔌 {len(results['busy'])}  "
                         f"❌ {len(results['failed'])}"
                     )
                 except Exception:
@@ -264,6 +285,9 @@ async def _bulk_check_sessions(msg, accounts: list):
     if results["invalid"]:
         lines.append(f"⚠️ Потрібні нові cookies: <b>{len(results['invalid'])}</b>")
         lines += [f"  • {e}" for e in results["invalid"]]
+    if results["busy"]:
+        lines.append(f"🔌 Зайняті (пропущено): <b>{len(results['busy'])}</b>")
+        lines += [f"  • @{u}" for u in results["busy"]]
     if results["failed"]:
         lines.append(f"❌ Помилки: <b>{len(results['failed'])}</b>")
         lines += [f"  • {e}" for e in results["failed"]]

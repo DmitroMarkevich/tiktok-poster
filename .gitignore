@@ -37,3 +37,4 @@ __pycache__/
 
 # ── Claude Code local config ──────────────────────────────────────────
 .claude/
+geo_cache.json

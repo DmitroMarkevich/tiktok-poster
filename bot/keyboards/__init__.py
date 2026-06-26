@@ -12,8 +12,16 @@ def main_menu(is_superadmin: bool = False) -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="🌐 Проксі", callback_data="proxies"),
         ],
         [
+            InlineKeyboardButton(text="🔥 Прогрів", callback_data="warmup"),
+            InlineKeyboardButton(text="🤖 Автопілот", callback_data="autopilot"),
+        ],
+        [
             InlineKeyboardButton(text="📊 Статистика", callback_data="stats"),
             InlineKeyboardButton(text="⚙️ Налаштування", callback_data="settings"),
+        ],
+        [
+            InlineKeyboardButton(text="📧 Outlook регер", callback_data="outlook"),
+            InlineKeyboardButton(text="📡 Стан бота", callback_data="live_status"),
         ],
     ]
     if is_superadmin:
@@ -65,6 +73,23 @@ def upload_menu_kb(active_count: int) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="☑️ Вибрати акаунти", callback_data="upload_select")],
         [InlineKeyboardButton(text="📤 Один акаунт", callback_data="upload_one")],
         [InlineKeyboardButton(text="◀️ Назад", callback_data="main_menu")],
+    ])
+
+
+def media_choice_kb() -> InlineKeyboardMarkup:
+    """After account scope is chosen: pick what to publish — a video or a photo carousel."""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🎬 Відео", callback_data="media_video")],
+        [InlineKeyboardButton(text="🖼 Карусель фото", callback_data="media_carousel")],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="upload_menu")],
+    ])
+
+
+def photos_done_kb(n: int) -> InlineKeyboardMarkup:
+    """Shown while collecting carousel photos: finish or cancel."""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"✅ Готово ({n} фото)", callback_data="carousel_done")],
+        [InlineKeyboardButton(text="❌ Скасувати", callback_data="main_menu")],
     ])
 
 
@@ -126,6 +151,79 @@ def privacy_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="🌍 Публічне", callback_data="privacy_public")],
         [InlineKeyboardButton(text="👥 Друзі", callback_data="privacy_friends")],
         [InlineKeyboardButton(text="🔒 Приватне", callback_data="privacy_private")],
+    ])
+
+
+# ── Warmup ────────────────────────────────────────────────────────────────────
+
+def warmup_menu_kb(active_count: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"🔥🔥 Прогріти всі ({active_count})", callback_data="wu_all")],
+        [InlineKeyboardButton(text="☑️ Вибрати акаунти", callback_data="wu_select")],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="main_menu")],
+    ])
+
+
+def select_warmup_accounts_kb(accounts: list, selected_ids: set) -> InlineKeyboardMarkup:
+    rows = []
+    for acc in accounts:
+        icon = "✅" if acc.id in selected_ids else "☐"
+        rows.append([InlineKeyboardButton(
+            text=f"{icon} @{acc.username}",
+            callback_data=f"toggle_wu_acc_{acc.id}"
+        )])
+    rows.append([
+        InlineKeyboardButton(text="✅ Всі", callback_data="select_all_wu_accs"),
+        InlineKeyboardButton(text="◻️ Скинути", callback_data="deselect_all_wu_accs"),
+    ])
+    n = len(selected_ids)
+    rows.append([InlineKeyboardButton(
+        text=f"➡️ Далі ({n} обрано)" if n else "➡️ Далі",
+        callback_data="wu_selected_confirm"
+    )])
+    rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data="warmup")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def warmup_route_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔍 Пошук за темою", callback_data="wu_route_search")],
+        [InlineKeyboardButton(text="#️⃣ Хештег", callback_data="wu_route_hashtag")],
+        [InlineKeyboardButton(text="📱 Стрічка «Для вас»", callback_data="wu_route_foryou")],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="warmup")],
+    ])
+
+
+def warmup_duration_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="10 хв", callback_data="wu_dur_10"),
+            InlineKeyboardButton(text="20 хв", callback_data="wu_dur_20"),
+            InlineKeyboardButton(text="40 хв", callback_data="wu_dur_40"),
+        ],
+        [InlineKeyboardButton(text="◀️ Скасувати", callback_data="main_menu")],
+    ])
+
+
+# ── Autopilot ─────────────────────────────────────────────────────────────────
+
+def autopilot_menu_kb(running: bool) -> InlineKeyboardMarkup:
+    if running:
+        rows = [[InlineKeyboardButton(text="⏹ Зупинити автопілот", callback_data="ap_stop")]]
+    else:
+        rows = [[InlineKeyboardButton(text="▶️ Запустити", callback_data="ap_start")]]
+    rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data="main_menu")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def autopilot_warmup_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="Без прогріву", callback_data="ap_wm_0"),
+            InlineKeyboardButton(text="10 хв", callback_data="ap_wm_10"),
+            InlineKeyboardButton(text="20 хв", callback_data="ap_wm_20"),
+        ],
+        [InlineKeyboardButton(text="◀️ Скасувати", callback_data="main_menu")],
     ])
 
 
